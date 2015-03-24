@@ -35,13 +35,13 @@ class Router(object):
 
             if got_packet:
                 log_debug("Got a packet: {}".format(str(packet)))
-                if self.arp_for_me(packet):
+                if self.is_arp_for_me(packet):
                     self.send_arp_reply(device_name, packet)
 
-    def arp_for_me(self, packet):
+    def is_arp_for_me(self, packet):
         '''
         '''
-        if packet.get_header(Arp) is not None:
+        if packet.get_header(Arp):
             arp = packet.get_header(Arp)
             for interface in self.my_interfaces:
                 if interface.ipaddr == arp.targetprotoaddr:
