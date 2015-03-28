@@ -15,7 +15,9 @@ class Router(object):
     def __init__(self, net):
         self.net = net
         self.my_interfaces = net.interfaces()
-        # Interface = (devname, macaddr, ipaddr, netmask) object
+        self.my_forwarding_table = self.make_forwarding_table()
+        self.my_arp_cache = {}
+        self.my_arp_queue = {}
 
     def router_main(self):
         '''
@@ -23,6 +25,7 @@ class Router(object):
         packets until the end of time.
         '''
         while True:
+            self.resend_arp_requests()
             got_packet = True
             try:
                 device_name,packet = self.net.recv_packet(timeout=1.0)
@@ -35,33 +38,168 @@ class Router(object):
 
             if got_packet:
                 log_debug("Got a packet: {}".format(str(packet)))
-                if self.is_arp_for_me(packet):
-                    self.send_arp_reply(device_name, packet)
+                arp_header = packet.get_header(Arp)
+                if arp_header:
+                    for interface in self.my_interfaces:
+                        if interface.ipaddr == arp_header.targetprotoaddr:
+                            if arp_header.operation is ArpOperation.Request:
+                                self.send_arp_reply(device_name, packet)
+                            elif arp_header.operation is ArpOperation.Reply:
+                                self.handle_arp_reply(packet)
+                else:
+                    self.forward_packet(packet)
 
-    def is_arp_for_me(self, packet):
-        '''
-        '''
-        if packet.get_header(Arp):
-            arp = packet.get_header(Arp)
-            for interface in self.my_interfaces:
-                if interface.ipaddr == arp.targetprotoaddr:
-                    return True
-        else:
-            return False
 
     def send_arp_reply(self, device_name, packet):
         '''
+
         '''
-        arp             = packet.get_header(Arp)
+        arp_header      = packet.get_header(Arp)
         send_out_device = self.net.interface_by_name(device_name)
-        senderhwaddr    = send_out_device.ethaddr
-        targethwaddr    = arp.senderhwaddr
-        senderprotoaddr = send_out_device.ipaddr
-        targetprotoaddr = arp.senderprotoaddr
-        arp_reply       = create_ip_arp_reply(senderhwaddr, targethwaddr, senderprotoaddr, targetprotoaddr)
+        target_mac      = arp_header.senderhwaddr
+        target_ip       = arp_header.senderprotoaddr
+        arp_reply       = create_ip_arp_reply(send_out_device.ethaddr, target_mac,
+                                              send_out_device.ipaddr, target_ip)
 
         self.net.send_packet(send_out_device.name, arp_reply)
 
+
+    #TODO: create class for arp queue things
+    def send_arp_request(self, target_ip, send_out_device_name, packet):
+        '''
+        '''
+        for interface in self.my_interfaces:
+            if interface.name == send_out_device_name:
+                arp_request = create_ip_arp_request(interface.ethaddr,
+                                                    interface.ipaddr,
+                                                    target_ip)
+                target_ip_string = str(target_ip)
+
+                if target_ip_string in self.my_arp_queue:
+                    self.my_arp_queue[target_ip_string][2] += 1
+                    self.my_arp_queue[target_ip_string][3] = time.time()
+
+                    self.net.send_packet(self.my_arp_queue[target_ip_string][1],
+                                         self.my_arp_queue[target_ip_string][4])
+                else:
+                    self.my_arp_queue[target_ip_string] = [packet,
+                                                           send_out_device_name,
+                                                           1, time.time(),
+                                                           arp_request]
+
+                    self.net.send_packet(send_out_device_name, arp_request)
+
+
+    #TODO: doesn't delete entries with request_count of 5
+    def resend_arp_requests(self):
+        '''
+        '''
+        if self.my_arp_queue:
+            for ip in self.my_arp_queue:
+                my_packet = self.my_arp_queue[ip][0]
+                my_interface = self.my_arp_queue[ip][1]
+                request_count = self.my_arp_queue[ip][2]
+                time_since_last_request = self.my_arp_queue[ip][3]
+
+                if request_count == 5: continue
+
+                if time.time() - time_since_last_request > 1:
+                    ip = IPv4Address(ip)
+                    self.send_arp_request(ip, my_interface, my_packet)
+
+
+    def handle_arp_reply(self, arp_reply):
+        '''
+        '''
+        arp_reply_arp_header = arp_reply[1]
+        arp_reply_sender_ip = arp_reply_arp_header.senderprotoaddr
+        arp_reply_sender_mac = arp_reply_arp_header.senderhwaddr
+
+        self.my_arp_cache[arp_reply_sender_ip] = arp_reply_sender_mac
+
+        arp_reply_sender_ip_string = str(arp_reply_sender_ip)
+        matched_arp_queue_entry = self.my_arp_queue.pop(arp_reply_sender_ip_string)
+
+        if matched_arp_queue_entry:
+            new_packet = matched_arp_queue_entry[0]
+            port_to_forward_out_of = matched_arp_queue_entry[1]
+            send_out_device = self.net.interface_by_name(port_to_forward_out_of)
+            new_packet[0].src = send_out_device.ethaddr
+            new_packet[0].dst = arp_reply_sender_mac
+            self.net.send_packet(port_to_forward_out_of, new_packet)
+
+
+    def make_forwarding_table(self):
+        '''
+        '''
+        forwarding_table = []
+        file_object = open('forwarding_table.txt', 'r')
+        while True:
+            line = file_object.readline()
+            if line:
+                forwarding_table.append(line.strip().split(' '))
+            else:
+                break
+        file_object.close()
+
+        for interface in self.my_interfaces:
+            network_address = str(interface.ipaddr)
+            network_mask = str(interface.netmask)
+            next_hop_ip = "I'm an interface"
+            interface_name = interface.name
+            table_entry = [network_address, network_mask, next_hop_ip,
+                           interface_name]
+            forwarding_table.append(table_entry)
+        return forwarding_table
+
+
+    #TODO: raise exception instead of returning None
+    def forward_packet(self, packet):
+        '''
+        '''
+        ip_header = packet.get_header_by_name('IPv4')
+        destination_ip = ip_header.dstip
+        match = self.find_longest_prefix_match(destination_ip)
+        ip_header.ttl -= 1 # assume TTL > 0 after decrement
+
+        if match:
+            network_prefix = match[0]
+            network_mask = match[1]
+            next_hop_ip = match[2]
+            send_out_device_name = match[3]
+
+            if next_hop_ip == "I'm an interface":
+                target_ip = str(destination_ip)
+            else:
+                target_ip = next_hop_ip
+
+            target_ip = IPv4Address(target_ip)
+
+            if target_ip in self.my_arp_cache:
+                destination_mac = self.my_arp_cache[target_ip]
+                send_out_device = self.net.interface_by_name(send_out_device_name)
+                packet[0].src = send_out_device.ethaddr
+                packet[0].dst = destination_mac
+                self.net.send_packet(send_out_device_name, packet)
+            else:
+                self.send_arp_request(target_ip, send_out_device_name, packet)
+
+    #TODO: raise exception instead of returning None
+    def find_longest_prefix_match(self, destination_ip):
+        '''
+        '''
+        max_prefix_len = 0
+        match = None
+        for table_entry in self.my_forwarding_table:
+            prefix_and_mask = table_entry[0] + '/' + table_entry[1]
+            network_prefix = IPv4Network(prefix_and_mask, False)
+
+            if destination_ip in network_prefix:
+                if network_prefix.prefixlen > max_prefix_len:
+                    max_prefix_len = network_prefix.prefixlen
+                    match = table_entry
+
+        return match
 
 def switchy_main(net):
     '''
